@@ -1,3 +1,3 @@
-# Реализация паттерна Circuit breaker
+# Реализация паттерна Circuit breaker (WIP)
 
-Базовая реализация паттерна Circuit breaker.
+Базовая реализация паттерна Circuit breaker. WIP
