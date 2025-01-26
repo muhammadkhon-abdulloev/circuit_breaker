@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -31,12 +32,12 @@ type CircuitBreaker[TRequest, TResponse any] struct {
 	errorThreshold float64
 	// halfOpenLimit - лимит запросов в статусе halfOpen после чего статус предохранителя перейдет на другой
 	halfOpenLimit int64
-	// errorResponses - количество зафейленных запросов
-	errorResponses int64
-	// successResponses - количество успешных запросов
-	successResponses int64
-	// totalResponses - общее количество запросов
-	totalResponses int64
+	// errorResponsesCount - количество зафейленных запросов
+	errorResponsesCount atomic.Int64
+	// successResponsesCount - количество успешных запросов
+	successResponsesCount atomic.Int64
+	// totalExecutionsCount - общее количество запросов
+	totalExecutionsCount atomic.Int64
 }
 
 func NewCB[TRequest, TResponse any](timeout, recoverTimeout time.Duration, errorThreshold float64, halfOpenLimit int64) *CircuitBreaker[TRequest, TResponse] {
@@ -52,14 +53,13 @@ func NewCB[TRequest, TResponse any](timeout, recoverTimeout time.Duration, error
 
 func (cb *CircuitBreaker[TRequest, TResponse]) Execute(ctx context.Context, params TRequest, f func(context.Context, TRequest) (TResponse, error)) (TResponse, error) {
 	cb.mx.Lock()
-
 	if cb.status == StatusOpen {
 		cb.mx.Unlock()
 		return *new(TResponse), ErrCircuitOpened
 	}
-
-	cb.totalResponses++
 	cb.mx.Unlock()
+
+	cb.totalExecutionsCount.Add(1)
 
 	ctx, cancel := context.WithTimeout(ctx, cb.timeout)
 	defer cancel()
@@ -69,17 +69,18 @@ func (cb *CircuitBreaker[TRequest, TResponse]) Execute(ctx context.Context, para
 		err    error
 	}
 
-	ch := make(chan response, 1)
+	ch := make(chan response)
 
 	go func() {
 		defer close(ch)
 
-		if ctx.Err() != nil {
-			return
+		result, err := f(ctx, params)
+
+		select {
+		case <-ctx.Done():
+		case ch <- response{result: result, err: err}:
 		}
 
-		result, err := f(ctx, params)
-		ch <- response{result: result, err: err}
 	}()
 
 	select {
@@ -104,17 +105,14 @@ func (cb *CircuitBreaker[TRequest, TResponse]) incrementErrors() {
 	cb.mx.Lock()
 	defer cb.mx.Unlock()
 
-	cb.errorResponses++
-	cb.totalResponses++
-	cb.successResponses = 0
+	cb.errorResponsesCount.Add(1)
+	cb.totalExecutionsCount.Add(1)
+	cb.successResponsesCount.Store(0)
 }
 
 func (cb *CircuitBreaker[TRequest, TResponse]) incrementSuccesses() {
-	cb.mx.Lock()
-	defer cb.mx.Unlock()
-
-	cb.successResponses++
-	cb.totalResponses++
+	cb.successResponsesCount.Add(1)
+	cb.totalExecutionsCount.Add(1)
 }
 
 func (cb *CircuitBreaker[TRequest, TResponse]) setStatus(status Status) {
@@ -125,31 +123,34 @@ func (cb *CircuitBreaker[TRequest, TResponse]) setStatus(status Status) {
 }
 
 func (cb *CircuitBreaker[TRequest, TResponse]) resetCounters() {
-	cb.errorResponses = 0
-	cb.successResponses = 0
-	cb.totalResponses = 0
+	cb.errorResponsesCount.Store(0)
+	cb.successResponsesCount.Store(0)
+	cb.totalExecutionsCount.Store(0)
 }
 
 func (cb *CircuitBreaker[TRequest, TResponse]) recover() {
 	time.Sleep(cb.recoverTimeout)
 
 	cb.mx.Lock()
-	defer cb.mx.Unlock()
 
 	if cb.status == StatusOpen {
+		cb.mx.Unlock()
+
 		cb.resetCounters()
 		cb.setStatus(StatusHalfOpen)
 
 		return
 	}
+
+	cb.mx.Unlock()
 }
 
 func (cb *CircuitBreaker[TRequest, TResponse]) handleError() {
 	cb.incrementErrors()
 
-	percentage := (float64(cb.errorResponses) / float64(cb.totalResponses)) * 100
+	errorsPercentage := float64(cb.errorResponsesCount.Load()) / float64(cb.totalExecutionsCount.Load()) * 100
 
-	if percentage >= cb.errorThreshold || (cb.status == StatusHalfOpen && cb.errorResponses >= cb.halfOpenLimit) {
+	if errorsPercentage >= cb.errorThreshold || (cb.status == StatusHalfOpen && cb.errorResponsesCount.Load() >= cb.halfOpenLimit) {
 		cb.setStatus(StatusOpen)
 
 		go cb.recover()
@@ -159,7 +160,7 @@ func (cb *CircuitBreaker[TRequest, TResponse]) handleError() {
 func (cb *CircuitBreaker[TRequest, TResponse]) handleSuccessResponse() {
 	cb.incrementSuccesses()
 
-	if cb.status == StatusHalfOpen && cb.successResponses >= cb.halfOpenLimit {
+	if cb.status == StatusHalfOpen && cb.successResponsesCount.Load() >= cb.halfOpenLimit {
 		cb.setStatus(StatusClosed)
 	}
 }

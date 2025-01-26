@@ -7,7 +7,7 @@ import (
 )
 
 func TestCircuitBreaker_Execute(t *testing.T) {
-	cb := NewCB[time.Duration, string](time.Second*3, time.Second*4, 1, 3)
+	cb := NewCB[time.Duration, string](time.Second*3, time.Second*3, 1, 3)
 
 	testCases := []TestCase[time.Duration, string]{
 		{
@@ -28,7 +28,7 @@ func TestCircuitBreaker_Execute(t *testing.T) {
 		{
 			name:     "Fail_Context_Timeout",
 			f:        F,
-			params:   time.Second * 5,
+			params:   time.Second * 10,
 			mustFail: true,
 		},
 		{
@@ -42,7 +42,7 @@ func TestCircuitBreaker_Execute(t *testing.T) {
 			name:     "Fail_Status_Open",
 			f:        F,
 			params:   time.Second * 1,
-			sleepFor: time.Second * 2,
+			sleepFor: time.Second * 1,
 			mustFail: true,
 		},
 
