@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -22,32 +21,32 @@ const (
 
 type CircuitBreaker[TRequest, TResponse any] struct {
 	mx *sync.Mutex
-	// timeout - сколько секунд будет отрабатывать запрос
+	// timeout - лимит обработки запроса
 	timeout time.Duration
 	// recoverTimeout - сколько секунд предохранитель будет в статусе opened
 	recoverTimeout time.Duration
-	// status - текущий статус нашего предохранителя
+	// status - текущий статус предохранителя
 	status Status
 	// errorThreshold - при каком количестве зафейленных запросов переключаться на статус opened
 	errorThreshold float64
 	// halfOpenLimit - лимит запросов в статусе halfOpen после чего статус предохранителя перейдет на другой
 	halfOpenLimit int64
-	// errorResponsesCount - количество зафейленных запросов
-	errorResponsesCount atomic.Int64
-	// successResponsesCount - количество успешных запросов
-	successResponsesCount atomic.Int64
-	// totalExecutionsCount - общее количество запросов
-	totalExecutionsCount atomic.Int64
+	// responsesThreshold - количество последних запросов которые будут учитываться при подсчете errorThreshold
+	responsesThreshold int64
+	// responses - хранит в себе результаты запросов (fail - false, success - true)
+	responses []bool
 }
 
-func NewCB[TRequest, TResponse any](timeout, recoverTimeout time.Duration, errorThreshold float64, halfOpenLimit int64) *CircuitBreaker[TRequest, TResponse] {
+func NewCB[TRequest, TResponse any](timeout, recoverTimeout time.Duration, errorThreshold float64, halfOpenLimit int64, responsesThreshold int64) *CircuitBreaker[TRequest, TResponse] {
 	return &CircuitBreaker[TRequest, TResponse]{
-		mx:             &sync.Mutex{},
-		timeout:        timeout,
-		recoverTimeout: recoverTimeout,
-		status:         StatusClosed,
-		errorThreshold: errorThreshold,
-		halfOpenLimit:  halfOpenLimit,
+		mx:                 &sync.Mutex{},
+		timeout:            timeout,
+		recoverTimeout:     recoverTimeout,
+		status:             StatusClosed,
+		errorThreshold:     errorThreshold,
+		halfOpenLimit:      halfOpenLimit,
+		responsesThreshold: responsesThreshold,
+		responses:          make([]bool, 0, responsesThreshold+1),
 	}
 }
 
@@ -58,8 +57,6 @@ func (cb *CircuitBreaker[TRequest, TResponse]) Execute(ctx context.Context, para
 		return *new(TResponse), ErrCircuitOpened
 	}
 	cb.mx.Unlock()
-
-	cb.totalExecutionsCount.Add(1)
 
 	ctx, cancel := context.WithTimeout(ctx, cb.timeout)
 	defer cancel()
@@ -85,34 +82,65 @@ func (cb *CircuitBreaker[TRequest, TResponse]) Execute(ctx context.Context, para
 
 	select {
 	case <-ctx.Done():
-		cb.handleError()
+		cb.handleResponse(false)
 
 		return *new(TResponse), ctx.Err()
 	case result := <-ch:
 		if result.err != nil {
-			cb.handleError()
+			cb.handleResponse(false)
 
 			return *new(TResponse), result.err
 		}
 
-		cb.handleSuccessResponse()
+		cb.handleResponse(true)
 
 		return result.result, nil
 	}
 }
 
-func (cb *CircuitBreaker[TRequest, TResponse]) incrementErrors() {
+func (cb *CircuitBreaker[TRequest, TResponse]) handleResponse(response bool) {
+	cb.addResponse(response)
+
+	var (
+		errorsCount    int64 = 0
+		successesCount int64 = 0
+	)
+
+	for _, res := range cb.responses {
+		if res {
+			successesCount++
+		} else {
+			errorsCount++
+			successesCount = 0
+		}
+	}
+
+	cb.handleStatus(successesCount, errorsCount)
+}
+
+func (cb *CircuitBreaker[TRequest, TResponse]) addResponse(response bool) {
 	cb.mx.Lock()
 	defer cb.mx.Unlock()
 
-	cb.errorResponsesCount.Add(1)
-	cb.totalExecutionsCount.Add(1)
-	cb.successResponsesCount.Store(0)
+	threshold := int(cb.responsesThreshold)
+	if len(cb.responses) >= threshold {
+		cb.responses = cb.responses[len(cb.responses)-threshold+1:]
+	}
+
+	cb.responses = append(cb.responses, response)
 }
 
-func (cb *CircuitBreaker[TRequest, TResponse]) incrementSuccesses() {
-	cb.successResponsesCount.Add(1)
-	cb.totalExecutionsCount.Add(1)
+func (cb *CircuitBreaker[TRequest, TResponse]) handleStatus(successesCount, errorsCount int64) {
+	if cb.status == StatusHalfOpen && successesCount >= cb.halfOpenLimit {
+		cb.setStatus(StatusClosed)
+	}
+
+	errorsPercentage := float64(errorsCount) / float64(len(cb.responses)) * 100
+	if errorsPercentage >= cb.errorThreshold || (cb.status == StatusHalfOpen && errorsCount >= cb.halfOpenLimit) {
+		cb.setStatus(StatusOpen)
+
+		go cb.recover()
+	}
 }
 
 func (cb *CircuitBreaker[TRequest, TResponse]) setStatus(status Status) {
@@ -120,12 +148,7 @@ func (cb *CircuitBreaker[TRequest, TResponse]) setStatus(status Status) {
 	defer cb.mx.Unlock()
 
 	cb.status = status
-}
-
-func (cb *CircuitBreaker[TRequest, TResponse]) resetCounters() {
-	cb.errorResponsesCount.Store(0)
-	cb.successResponsesCount.Store(0)
-	cb.totalExecutionsCount.Store(0)
+	cb.responses = make([]bool, 0, cb.responsesThreshold+1)
 }
 
 func (cb *CircuitBreaker[TRequest, TResponse]) recover() {
@@ -136,31 +159,11 @@ func (cb *CircuitBreaker[TRequest, TResponse]) recover() {
 	if cb.status == StatusOpen {
 		cb.mx.Unlock()
 
-		cb.resetCounters()
 		cb.setStatus(StatusHalfOpen)
 
 		return
 	}
 
 	cb.mx.Unlock()
-}
 
-func (cb *CircuitBreaker[TRequest, TResponse]) handleError() {
-	cb.incrementErrors()
-
-	errorsPercentage := float64(cb.errorResponsesCount.Load()) / float64(cb.totalExecutionsCount.Load()) * 100
-
-	if errorsPercentage >= cb.errorThreshold || (cb.status == StatusHalfOpen && cb.errorResponsesCount.Load() >= cb.halfOpenLimit) {
-		cb.setStatus(StatusOpen)
-
-		go cb.recover()
-	}
-}
-
-func (cb *CircuitBreaker[TRequest, TResponse]) handleSuccessResponse() {
-	cb.incrementSuccesses()
-
-	if cb.status == StatusHalfOpen && cb.successResponsesCount.Load() >= cb.halfOpenLimit {
-		cb.setStatus(StatusClosed)
-	}
 }

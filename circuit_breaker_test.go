@@ -7,7 +7,7 @@ import (
 )
 
 func TestCircuitBreaker_Execute(t *testing.T) {
-	cb := NewCB[time.Duration, string](time.Second*3, time.Second*3, 1, 3)
+	cb := NewCB[time.Duration, string](time.Second*3, time.Second*3, 20, 3, 3)
 
 	testCases := []TestCase[time.Duration, string]{
 		{
